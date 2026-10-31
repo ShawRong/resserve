@@ -1,13 +1,13 @@
-# ResInfer
+# ResServe
 
 **Published: October 20, 2026**
 
-ResInfer is a framework for **accurate** and **efficient FP4 inference** on
+ResServe is a framework for **accurate** and **efficient FP4 inference** on
 NVIDIA Blackwell GPUs. It combines **residue error compensation** with
 **fused GPU kernels** to reduce quantization error while keeping inference fast.
 
 With **NVFP4 and MXFP4** linear kernels, **NVFP4 decode attention**, ModelOpt
-export, FlashInfer autotuning and **vLLM integration**, ResInfer connects
+export, FlashInfer autotuning and **vLLM integration**, ResServe connects
 quantization research to practical model serving.
 
 ## ✨ Highlights
@@ -20,7 +20,7 @@ quantization research to practical model serving.
 
 <sub>NVFP4 Fold supports SM120 in addition to SM100; MXFP4 MEXT and ResAttn target SM100.</sub>
 
-> ⭐ **Find ResInfer useful?** Give us a star to support the project and help
+> ⭐ **Find ResServe useful?** Give us a star to support the project and help
 > more people discover accurate and efficient FP4 inference. We welcome your
 > feedback, issues and contributions!
 
@@ -192,8 +192,8 @@ Our paper will be released soon. In the meantime, you can cite the software
 using this temporary entry; we will replace it with the paper citation.
 
 ```bibtex
-@misc{resinfer2026,
-  title = {ResInfer},
+@misc{ResServe2026,
+  title = {ResServe},
   year = {2026},
   note = {Software release, October 20, 2026. Paper forthcoming.}
 }
@@ -206,10 +206,10 @@ GPUs for this project.
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ShawRong/ResInfer&type=Date)](https://star-history.com/#ShawRong/ResInfer&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=ShawRong/ResServe&type=Date)](https://star-history.com/#ShawRong/ResServe&Date)
 
 ## 📄 License
 
-Copyright © 2025–2026 Rong Shuo for ResInfer original work and modifications.
+Copyright © 2025–2026 Rong Shuo for ResServe original work and modifications.
 Original work is licensed under Apache-2.0; third-party portions retain their
 upstream rights and license conditions. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
