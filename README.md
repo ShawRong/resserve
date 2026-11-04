@@ -30,50 +30,32 @@ The figures below show operator measurements on a B200, not model throughput
 or task accuracy. FI denotes FlashInfer; TRT denotes TensorRT-LLM kernels
 exposed through FlashInfer.
 
-### Operator precision
+### MEXT · NVFP4 and MXFP4
 
 **Lower operator error:** MEXT reduces pooled NMSE by **16.6% with NVFP4**
 and **20.3% with MXFP4** relative to their respective FI W4A4 baselines
 on the captured Qwen3-32B inputs.
 
-Real inputs captured from a frozen Qwen3-32B inference replay are compared
-with FP32 references. Points are paired input-level NMSE ratios; diamonds are
-ratios of pooled NMSE, computed from total squared error and reference energy.
-Lower is better. The sample contains 72 linear inputs per arm and 18 attention
-inputs.
+The latency comparison below groups **NVFP4 on the left** and **MXFP4 on the
+right**. Green curves show MEXT; lower is faster.
 
-Attention has two references: attention computed from dequantized stored KV,
-and attention computed from the original BF16 KV before cache quantization.
-They separate attention arithmetic error from total local error including KV
-storage. These are operator errors, not downstream model-quality scores;
-selective KEXT precision is not included in this figure.
+![MEXT latency with NVFP4 and MXFP4](assets/mext.png)
 
-![Paired operator precision](assets/precision.png)
+<details>
+<summary>Linear measurement details</summary>
 
-### MEXT
+The precision comparison uses 72 paired real inputs from Qwen3-32B and FP32
+references. Each format's four latency panels show representative projection
+shapes.
 
 Linear latency plots show matched per-process ratios: lines are medians and
-error bars are the full range across five sequential process runs. The four
-panels use public Qwen3 projection shapes. Performance varies with shape and
-batch size; no universal speedup is implied.
+error bars are the full range across five sequential process runs. Performance
+varies with shape and batch size.
 
 MEXT trades a small residue computation for reduced FP4 operator error. Compare
 its latency with both W4A4 and W4A8 controls; the W4A4 line is the normalization
 baseline, not an accuracy-equivalent implementation. NVFP4 and MXFP4 use their
 respective FI baselines.
-
-![NVFP4 MEXT latency](assets/mext-nvfp4.png)
-
-![MXFP4 MEXT latency](assets/mext-mxfp4.png)
-
-### KEXT
-
-Selective ratios expose the cost of compensating more channels. These results
-use the FlashInfer `mm_fp4(backend="auto")` path and the automatic ratio1
-selector. Masks are synthetic for timing; these plots do not establish the
-quality of a calibrated checkpoint.
-
-![KEXT latency](assets/kext.png)
 
 **Linear timing boundary:** activation conversion/quantization and GEMM are
 included; weight preparation is excluded. TRT NVFP4/FP8 uses a precomputed
@@ -82,16 +64,48 @@ MXFP4/MXFP8 include online block quantization and scale generation. NVFP4
 paths also use precomputed global scales. Linear measurements use CUDA Graphs
 with rotating input buffers.
 
-### ResAttn
+</details>
 
-On these 11 prepared-KV decode cases, median speedups over stock TRT range
-from approximately **1.20× to 1.42×**. Both paths start with BF16 Q and the same
-synthetic NVFP4 KV cache and return BF16 output. Stock's Q conversion and output
-conversion are included. Timings use warm buffers and CUDA Graphs; cache
-construction is excluded. All three process repetitions per case are shown,
-including measurements flagged for stock-to-stock timing drift.
+### KEXT · Precision and latency
 
-![ResAttn BF16-output decode latency](assets/resattn.png)
+Selective compensation controls the added computation by compensating a subset
+of channels. **Left:** operator error at different ratios. **Right:** NVFP4
+latency relative to plain FI NVFP4. Lower is better in both groups.
+
+![KEXT operator precision and latency](assets/kext.png)
+
+<details>
+<summary>Selective compensation measurement details</summary>
+
+Panels (a–b) show pooled linear NMSE on 192 matched prefill input groups per
+model; `1.0*` marks full compensation. Panels (c–f) include online activation
+quantization and GEMM, with the linear timing boundary described above. Timing
+uses the FlashInfer `mm_fp4(backend="auto")` path with synthetic masks and
+automatic selection for full compensation.
+
+</details>
+
+### ResAttn · Speedup and precision
+
+ResAttn achieves up to **1.40×** speedup over TensorRT-LLM, with a median
+speedup of **1.19×** across 48 configurations; it is faster in 47.
+Panels (a–c) show speedup; panel (d) shows operator error against the native
+BF16-output TRT-LLM baseline.
+
+![ResAttn page32 decode latency and operator precision](assets/resattn.png)
+
+<details>
+<summary>Attention measurement details</summary>
+
+Panels (a–c) use identical BF16 queries and prepared page32 NVFP4 KV, with native
+BF16 output from both kernels. Timing includes query conversion and attention,
+excluding cache construction and KV append. Points show paired median
+speedups across three independent processes using warm-buffer CUDA Graphs.
+Panel (d) shows pooled NMSE against FP32 attention on the same dequantized KV,
+using 192 paired real inputs per model from Swift-27B and Qwen3.8-27B. This
+reference isolates attention computation error; lower NMSE is better.
+
+</details>
 
 ## 🚀 Installation
 
