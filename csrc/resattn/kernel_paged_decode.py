@@ -40,6 +40,12 @@ from .qmul4 import (
 mma_modes = (0, 1, 2)
 
 
+def _operand_mk_layout(tiled_mma, stage_layout, shape, reference):
+    logical = cute.make_layout(shape)
+    probe = cute.make_tensor(reference.iterator, logical)
+    partitioned = tiled_mma.get_slice(0).partition_A(probe)
+    to_fragment = cute.composition(cute.right_inverse(partitioned.layout), logical)
+    return cute.composition(stage_layout, to_fragment)
 def _sf_s2t_partition(sf_dtype, sSF, tSF):
     """Partition SMEM-to-TMEM scale copies, following CUTLASS mainloop_s2t_copy_and_partition."""
     tCsSF_compact = cute.filter_zeros(sSF)
@@ -80,7 +86,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             "kernel", "gmem_fused", "cga_sharded", "none"
         ] = "kernel",
         *,
-        page_size=128,
+        page_size=32,
         logical_grouped_heads: int | None = None,
         single_softmax_wg: bool = False,
         smem_correction_broadcast: bool = False,
@@ -91,8 +97,8 @@ class GroupedQueryAttentionDecodePagedFp4:
             raise NotImplementedError("production ResAttn requires residue Q8/Q16, D128/D256, decode")
         if reduction_mode not in ("none", "kernel", "gmem_fused", "cga_sharded"):
             raise ValueError(f"unsupported production reducer: {reduction_mode}")
-        if headdim == 256 and reduction_mode not in ("none", "kernel"):
-            raise NotImplementedError("D256 supports BF16 none/kernel reduction only")
+        if headdim == 256 and reduction_mode not in ("none", "kernel", "cga_sharded"):
+            raise NotImplementedError("D256 supports BF16 none/kernel/CGA reduction only")
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
         self.prediction_tile = prediction_tile
@@ -115,9 +121,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         self.threads_per_cta = (4 if single_softmax_wg else 5) * warpgroup_threads
         self.page_size = page_size
 
-        assert page_size == 128, (
-            "page_size must be 128 to align scale-factor atoms; page_size=64 is unsupported"
-        )
+        assert page_size == 32
         assert sequence_tile > 0 and sequence_tile % 128 == 0
         if logical_grouped_heads is not None:
             assert 0 < logical_grouped_heads <= grouped_head_tile
@@ -469,65 +473,57 @@ class GroupedQueryAttentionDecodePagedFp4:
             tma_tile_mnk,
             tiled_mma_kq,
         )
-        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mK_mkl,
-            cute.select(smem_layout_k, mma_modes),
-            tma_tile_mnk,
-            tiled_mma_kq,
+        k_mk_layout = _operand_mk_layout(
+            tiled_mma_kq, cute.select(smem_layout_k, mma_modes),
+            (mma_tile_m, mma_tile_k), mK_mkl,
         )
-        tma_tile_mnk_vp = (mma_tile_m_vp, tma_tile_n, mma_tile_k_vp)
-        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mV_mkl,
-            cute.select(smem_layout_v, mma_modes),
-            tma_tile_mnk_vp,
-            tiled_mma_vp,
-            internal_type=cutlass.Int8,
+        tma_atom_k, tma_tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_load_op, mK_mkl,
+            cute.composition(k_mk_layout, (self.page_size, mma_tile_k)),
+            (self.page_size, mma_tile_k),
         )
-
-        _hkv = v_sf.shape[1]
-        mVSF_d = cute.make_tensor(
-            v_sf.iterator,
-            cute.make_layout(
+        v_mk_layout = _operand_mk_layout(
+            tiled_mma_vp, cute.select(smem_layout_v, mma_modes),
+            (mma_tile_m_vp, mma_tile_k_vp), mV_mkl,
+        )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_load_op, mV_mkl,
+            cute.composition(v_mk_layout, (mma_tile_m_vp, self.page_size)),
+            (mma_tile_m_vp, self.page_size), internal_type=cutlass.Int8,
+        )
+        sf_page_bytes = self.page_size * (self.headdim // sf_vec_size)
+        sf_gather_layout = cute.make_layout((sf_page_bytes, 4), stride=(1, sf_page_bytes))
+        sf_indices = cute.make_tensor(block_tables.iterator, cute.make_layout(
+            (k_sf.shape[1] * sf_page_bytes, 4), stride=(0, 1)))
+        sf_gather_op = cute.nvgpu.cpasync.CopyBulkTensor2DGather4G2SOp()
+        if cutlass.const_expr(self.headdim == 128):
+            mVSF_d = cute.make_tensor(v_sf.iterator, cute.make_layout(
+                (v_sf.shape[1] * sf_page_bytes, v_sf.shape[0]), stride=(1, v_sf.stride[0])))
+            tma_atom_v_sf_d, tma_tensor_v_sf_d = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                sf_gather_op, mVSF_d, sf_gather_layout, (sf_page_bytes, 4),
+                gmem_coord_tensor=sf_indices)
+        else:
+            mVSF_d = cute.make_tensor(v_sf.iterator, cute.make_layout(
                 (4 * (self.headdim // 16), self.page_size // 4,
-                 (_hkv, v_sf.shape[0])),
-                stride=(
-                    1,
-                    4 * (self.headdim // 16),
-                    (v_sf.stride[1], v_sf.stride[0]),
-                ),
-            ),
-        )
-        tma_atom_v_sf_d, tma_tensor_v_sf_d = (
-            cute.nvgpu.cpasync.make_tiled_tma_atom(
-                tma_load_op,
-                mVSF_d,
-                cute.slice_(smem_layout_v_sf_d, (None, None, 0)),
-                (4 * (mma_tile_m_vp // 16), mma_tile_k_vp // 4),
-            )
-        )
-
-        _ksf_bytes = self.page_size * (self.headdim // sf_vec_size)
-        mSFK = cute.make_tensor(
-            k_sf.iterator,
-            cute.make_layout(
-                (16, _ksf_bytes // 16, (k_sf.shape[1], k_sf.shape[0])),
-                stride=(
-                    1,
-                    16,
-                    (k_sf.stride[1], k_sf.stride[0]),
-                ),
-            ),
-        )
-        tma_atom_sfk, tma_tensor_sfk = (
-            cute.nvgpu.cpasync.make_tiled_tma_atom(
-                tma_load_op,
-                mSFK,
-                cute.slice_(smem_layout_sfk_raw, (None, None, 0)),
-                (16, _ksf_bytes // 16),
-            )
-        )
+                 (v_sf.shape[1], v_sf.shape[0])),
+                stride=(1, 4 * (self.headdim // 16),
+                        (v_sf.stride[1], v_sf.stride[0]))))
+            vsf_box = (4 * (mma_tile_m_vp // 16), self.page_size // 4)
+            tma_atom_v_sf_d, tma_tensor_v_sf_d = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op, mVSF_d, cute.make_layout(vsf_box), vsf_box)
+        if cutlass.const_expr(self.headdim == 128):
+            mSFK = cute.make_tensor(k_sf.iterator, cute.make_layout(
+                (k_sf.shape[1] * sf_page_bytes, k_sf.shape[0]), stride=(1, k_sf.stride[0])))
+            tma_atom_sfk, tma_tensor_sfk = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                sf_gather_op, mSFK, sf_gather_layout, (sf_page_bytes, 4),
+                gmem_coord_tensor=sf_indices)
+        else:
+            mSFK = cute.make_tensor(k_sf.iterator, cute.make_layout(
+                (16, sf_page_bytes // 16, (k_sf.shape[1], k_sf.shape[0])),
+                stride=(1, 16, (k_sf.stride[1], k_sf.stride[0]))))
+            ksf_box = (16, sf_page_bytes // 16)
+            tma_atom_sfk, tma_tensor_sfk = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op, mSFK, cute.make_layout(ksf_box), ksf_box)
         sfq_layout = self._sf_layout_hb(
             mma_tile_n_sfb, self.headdim, mQ_nkl.shape[2], sf_vec_size
         )
@@ -1226,7 +1222,7 @@ class GroupedQueryAttentionDecodePagedFp4:
 
         partial_o = None
         if cutlass.const_expr(do_cga_red):
-            partial_o = cute.make_rmem_tensor((blk_tile_n,), acc_dtype)
+            partial_o = cute.make_rmem_tensor((blk_tile_n, tiles_dm), acc_dtype)
             partial_o.fill(0)
 
         if exit_early:
@@ -1253,114 +1249,69 @@ class GroupedQueryAttentionDecodePagedFp4:
                             mOSF[sf_offset] = sf_dtype(0)
 
         elif warp_idx == tma_kv_warp_id:
-            gK = cute.local_tile(
-                mK, tiler=(mma_tile_m, mma_tile_k), coord=(0, None, (coord_hk, None))
+            k_layout = _operand_mk_layout(
+                tiled_mma_kq, cute.select(tAsK.layout, mma_modes),
+                (mma_tile_m, mma_tile_k), tAsK,
             )
-
-            gV = cute.local_tile(
-                mV,
-                tiler=(mma_tile_m_vp, mma_tile_k_vp),
-                coord=(None, None, (coord_hk, None)),
-            )
-
-            tAgK = thrblk_mma_kq.partition_A(
-                gK
-            )
-            tAgV = thrblk_mma_vp.partition_A(
-                gV
-            )
-
+            sK = cute.make_tensor(tAsK.iterator, cute.append(
+                k_layout, cute.make_layout(kv_stages, stride=tAsK.stride[-1])))
+            sK_pages = cute.local_tile(sK, (page_size, mma_tile_k), (None, 0, None))
+            gK = cute.local_tile(mK, (page_size, mma_tile_k), (0, None, (coord_hk, None)))
             tGSsK, tGSgK = cute.nvgpu.cpasync.tma_partition(
-                tma_atom_k,
-                mcast_coord,
-                mcast_layout,
-                smem_tensor=cute.group_modes(tAsK, 0, 3),
-                gmem_tensor=cute.group_modes(tAgK, 0, 3),
+                tma_atom_k, mcast_coord, mcast_layout,
+                smem_tensor=cute.group_modes(sK_pages, 0, 2),
+                gmem_tensor=cute.group_modes(gK, 0, 2),
             )
-
-            tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
-                tma_atom_v,
-                mcast_coord,
-                mcast_layout,
-                smem_tensor=cute.group_modes(tAsV, 0, 3),
-                gmem_tensor=cute.group_modes(tAgV, 0, 3),
-            )
-            gVSFD = cute.local_tile(
-                mVSF_d,
-                tiler=(4 * (mma_tile_m_vp // 16), mma_tile_k_vp // 4),
-                coord=(None, None, (coord_hk, None)),
-            )
-            tGSsVSFD, tGSgVSFD = cute.nvgpu.cpasync.tma_partition(
-                tma_atom_v_sf_d,
-                mcast_coord,
-                mcast_layout,
-                smem_tensor=cute.group_modes(tAsVSFD, 0, 2),
-                gmem_tensor=cute.group_modes(gVSFD, 0, 2),
-            )
-            gSFK = cute.local_tile(
-                mSFK,
-                tiler=(16, self.page_size * (self.headdim // 16) // 16),
-                coord=(None, None, (coord_hk, None)),
-            )
-            tGSsSFK, tGSgSFK = cute.nvgpu.cpasync.tma_partition(
-                tma_atom_sfk,
-                mcast_coord,
-                mcast_layout,
-                smem_tensor=cute.group_modes(tAsSFKRaw, 0, 2),
-                gmem_tensor=cute.group_modes(gSFK, 0, 2),
-            )
-
+            if cutlass.const_expr(self.headdim == 128):
+                sf_page_bytes = page_size * (self.headdim // 16)
+                sf_ids = cute.make_rmem_tensor((4,), Int32)
+                sf_index_view = cute.make_tensor(sf_ids.iterator, cute.make_layout(
+                    ((sf_page_bytes, 4), 1), stride=((0, 1), 0)))
+                sSFK = cute.make_tensor(tAsSFKRaw.iterator, cute.make_layout(
+                    ((sf_page_bytes, 4), kv_stages),
+                    stride=((1, sf_page_bytes), smem_layout_sfk_raw.stride[-1])))
+                gSFK = cute.local_tile(mSFK, (sf_page_bytes, 4), (coord_hk, 0))
+                gSFK = cute.make_tensor(gSFK.iterator, cute.append(
+                    cute.group_modes(gSFK.layout, 0, 2), cute.make_layout(1)))
+                tGSsSFK, tGSgSFK, tGSiK = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_sfk, mcast_coord, mcast_layout, sSFK, [gSFK, sf_index_view])
+            else:
+                ksf_box = (16, page_size * (self.headdim // 16) // 16)
+                sSFK_pages = cute.local_tile(tAsSFKRaw, ksf_box, (0, None, None))
+                gSFK = cute.local_tile(mSFK, ksf_box, (0, 0, (coord_hk, None)))
+                tGSsSFK, tGSgSFK = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_sfk, mcast_coord, mcast_layout,
+                    smem_tensor=cute.group_modes(sSFK_pages, 0, 2),
+                    gmem_tensor=cute.group_modes(gSFK, 0, 2))
             cute.arch.griddepcontrol_wait()
-
-            v_prefetch_iters = 0 if self.is_q8 else prefetch_iters
-            prefetch_tiles = v_prefetch_iters * kv_splits
             k_token_tma = True
-            v_raw_token_tma = True
-            for s in cutlass.range(kv_split_idx, prefetch_tiles + tiles_s, kv_splits):
-                if s < tiles_s:
-                    for sm in cutlass.range_constexpr(tiles_sm):
-                        logical_k = s * pages_s + sm
-                        phys_k = Int32(-1)
-                        if logical_k < page_count:
-                            phys_k = mBlockTables[coord_b, logical_k]
-                        for dk in cutlass.range_constexpr(tiles_dk):
-                            k_handle = k_producer.acquire_and_advance(k_token_tma)
-                            k_token_tma = k_producer.try_acquire()
+            for s in cutlass.range(kv_split_idx, tiles_s, kv_splits):
+                for sm in cutlass.range_constexpr(tiles_sm):
+                    for dk in cutlass.range_constexpr(tiles_dk):
+                        k_handle = k_producer.acquire_and_advance(k_token_tma)
+                        k_token_tma = k_producer.try_acquire()
+                        for subpage in cutlass.range_constexpr(mma_tile_m // page_size):
+                            logical_k = s * pages_s + sm * (mma_tile_m // page_size) + subpage
+                            phys_k = Int32(-1)
+                            if logical_k < page_count:
+                                phys_k = mBlockTables[coord_b, logical_k]
                             cute.copy(
-                                tma_atom_k,
-                                tGSgK[None, dk, phys_k],
-                                tGSsK[None, k_handle.index],
+                                tma_atom_k, tGSgK[None, dk, phys_k],
+                                tGSsK[None, subpage, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
                             )
+                            if cutlass.const_expr(self.headdim == 128):
+                                sf_ids[subpage] = phys_k
+                            else:
+                                cute.copy(
+                                    tma_atom_sfk, tGSgSFK[None, phys_k],
+                                    tGSsSFK[None, subpage, k_handle.index],
+                                    tma_bar_ptr=k_handle.barrier)
+                        if cutlass.const_expr(self.headdim == 128):
                             cute.copy(
-                                tma_atom_sfk,
-                                tGSgSFK[None, 0, 0, phys_k],
+                                tma_atom_sfk, [tGSgSFK[None, 0], tGSiK[None, 0]],
                                 tGSsSFK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
-                            )
-                if s >= prefetch_tiles:
-                    s_v = s - prefetch_tiles
-                    for sk in cutlass.range_constexpr(tiles_sk):
-                        logical_v = s_v * pages_s + sk
-                        phys_v = Int32(-1)
-                        if logical_v < page_count:
-                            phys_v = mBlockTables[coord_b, logical_v]
-                        for dm in cutlass.range_constexpr(tiles_dm):
-                            v_handle = v_raw_producer.acquire_and_advance(
-                                v_raw_token_tma
-                            )
-                            v_raw_token_tma = v_raw_producer.try_acquire()
-                            cute.copy(
-                                tma_atom_v,
-                                tGSgV[None, dm, 0, phys_v],
-                                tGSsV[None, v_handle.index],
-                                tma_bar_ptr=v_handle.barrier,
-                            )
-                            cute.copy(
-                                tma_atom_v_sf_d,
-                                tGSgVSFD[None, dm, 0, phys_v],
-                                tGSsVSFD[None, v_handle.index],
-                                tma_bar_ptr=v_handle.barrier,
                             )
 
         elif warp_idx == tma_qo_warp_id:
@@ -1418,6 +1369,70 @@ class GroupedQueryAttentionDecodePagedFp4:
                 tma_bar_ptr=sfq_mbar,
             )
 
+            v_layout = _operand_mk_layout(
+                tiled_mma_vp, cute.select(tAsV.layout, mma_modes),
+                (mma_tile_m_vp, mma_tile_k_vp), tAsV,
+            )
+            sV = cute.make_tensor(tAsV.iterator, cute.append(
+                v_layout, cute.make_layout(kv_stages, stride=tAsV.stride[-1])))
+            sV_pages = cute.local_tile(sV, (mma_tile_m_vp, page_size), (0, None, None))
+            gV = cute.local_tile(mV, (mma_tile_m_vp, page_size), (None, 0, (coord_hk, None)))
+            tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_v, mcast_coord, mcast_layout,
+                smem_tensor=cute.group_modes(sV_pages, 0, 2),
+                gmem_tensor=cute.group_modes(gV, 0, 2),
+            )
+            if cutlass.const_expr(self.headdim == 128):
+                sf_page_bytes = page_size * (self.headdim // 16)
+                v_sf_ids = cute.make_rmem_tensor((4,), Int32)
+                v_sf_index_view = cute.make_tensor(v_sf_ids.iterator, cute.make_layout(
+                    ((sf_page_bytes, 4), 1), stride=((0, 1), 0)))
+                sVSF = cute.make_tensor(tAsVSFD.iterator, cute.make_layout(
+                    ((sf_page_bytes, 4), kv_stages),
+                    stride=((1, sf_page_bytes), smem_layout_v_sf_d.stride[-1])))
+                gVSFD = cute.local_tile(mVSF_d, (sf_page_bytes, 4), (coord_hk, 0))
+                gVSFD = cute.make_tensor(gVSFD.iterator, cute.append(
+                    cute.group_modes(gVSFD.layout, 0, 2), cute.make_layout(1)))
+                tGSsVSFD, tGSgVSFD, tGSiV = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_v_sf_d, mcast_coord, mcast_layout, sVSF, [gVSFD, v_sf_index_view])
+            else:
+                vsf_box = (4 * (mma_tile_m_vp // 16), page_size // 4)
+                sVSF = cute.make_tensor(tAsVSFD.iterator, smem_layout_v_sf_d)
+                sVSF_pages = cute.local_tile(sVSF, vsf_box, (0, None, None))
+                gVSFD = cute.local_tile(mVSF_d, vsf_box, (None, 0, (coord_hk, None)))
+                tGSsVSFD, tGSgVSFD = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_v_sf_d, mcast_coord, mcast_layout,
+                    smem_tensor=cute.group_modes(sVSF_pages, 0, 2),
+                    gmem_tensor=cute.group_modes(gVSFD, 0, 2))
+            v_raw_token_tma = True
+            for s_v in cutlass.range(kv_split_idx, tiles_s, kv_splits):
+                for sk in cutlass.range_constexpr(tiles_sk):
+                    for dm in cutlass.range_constexpr(tiles_dm):
+                        v_handle = v_raw_producer.acquire_and_advance(v_raw_token_tma)
+                        v_raw_token_tma = v_raw_producer.try_acquire()
+                        for subpage in cutlass.range_constexpr(mma_tile_k_vp // page_size):
+                            logical_v = s_v * pages_s + sk * (mma_tile_k_vp // page_size) + subpage
+                            phys_v = Int32(-1)
+                            if logical_v < page_count:
+                                phys_v = mBlockTables[coord_b, logical_v]
+                            cute.copy(
+                                tma_atom_v, tGSgV[None, dm, phys_v],
+                                tGSsV[None, subpage, v_handle.index],
+                                tma_bar_ptr=v_handle.barrier,
+                            )
+                            if cutlass.const_expr(self.headdim == 128):
+                                v_sf_ids[subpage] = phys_v
+                            else:
+                                cute.copy(
+                                    tma_atom_v_sf_d, tGSgVSFD[None, dm, phys_v],
+                                    tGSsVSFD[None, subpage, v_handle.index],
+                                    tma_bar_ptr=v_handle.barrier)
+                        if cutlass.const_expr(self.headdim == 128):
+                            cute.copy(
+                                tma_atom_v_sf_d, [tGSgVSFD[None, 0], tGSiV[None, 0]],
+                                tGSsVSFD[None, v_handle.index],
+                                tma_bar_ptr=v_handle.barrier,
+                            )
             coord_b_partial = (
                 kv_split_idx * batches + coord_b if do_partial_red else coord_b
             )
@@ -2193,7 +2208,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             output_final += correction.reshape((blk_tile_n, 1)) * output_prev
 
             if cutlass.const_expr(do_cga_red):
-                partial_o.store(output_final.reshape((blk_tile_n,)))
+                partial_o.store(output_final)
             else:
                 if cutlass.const_expr(do_none_red):
                     sM_final_nbar.arrive_and_wait()
@@ -2222,25 +2237,26 @@ class GroupedQueryAttentionDecodePagedFp4:
                 owner_thread = warpgroup_tidx // kv_splits
                 owner_threads = warpgroup_threads // kv_splits
 
-                partial_o_offset = (
-                    (kv_split_idx * owner_threads + owner_thread)
-                    * blk_tile_n
-                )
-                remote_partial_mbar = cute.arch.map_dsmem_ptr(
-                    cga_partial_mbar, owner_cta
-                )
-                remote_o = cute.make_tensor(
-                    cute.arch.map_dsmem_ptr(
-                        sCgaO.iterator + partial_o_offset, owner_cta
-                    ).align(16),
-                    cute.make_layout((blk_tile_n,)),
-                )
-                cute.copy(
-                    dsmem_o_atom,
-                    partial_o,
-                    remote_o,
-                    mbar_ptr=remote_partial_mbar,
-                )
+                for dm in cutlass.range_constexpr(tiles_dm):
+                    partial_o_offset = (
+                        dm * warpgroup_threads
+                        + kv_split_idx * owner_threads + owner_thread
+                    ) * blk_tile_n
+                    remote_partial_mbar = cute.arch.map_dsmem_ptr(
+                        cga_partial_mbar, owner_cta
+                    )
+                    remote_o = cute.make_tensor(
+                        cute.arch.map_dsmem_ptr(
+                            sCgaO.iterator + partial_o_offset, owner_cta
+                        ).align(16),
+                        cute.make_layout((blk_tile_n,)),
+                    )
+                    cute.copy(
+                        dsmem_o_atom,
+                        partial_o[None, dm],
+                        remote_o,
+                        mbar_ptr=remote_partial_mbar,
+                    )
 
                 if warpgroup_widx == 0:
                     local_stat = cute.make_rmem_tensor(
@@ -2280,51 +2296,96 @@ class GroupedQueryAttentionDecodePagedFp4:
                 cute.arch.fence_acq_rel_cta()
                 cute.arch.mbarrier_wait(cga_partial_mbar, phase=0)
 
-                if owner_cta == kv_split_idx:
-                    final_o = cute.make_rmem_tensor((blk_tile_n,), o_dtype)
-                    for head in cutlass.range_constexpr(blk_tile_n):
+                if cutlass.const_expr(tiles_dm == 2):
+                    merge_heads = self.logical_grouped_heads
+                    if cutlass.const_expr(merge_heads is None):
+                        merge_heads = blk_tile_n
+                    for task in cutlass.range(
+                        warpgroup_tidx, owner_threads * merge_heads, warpgroup_threads
+                    ):
+                        head = task % merge_heads
+                        row = task // merge_heads
                         reduced_max = sCgaStats[0, head, 0]
                         reduced_sum = sCgaStats[0, head, 1]
-                        reduced_o = Float32(
-                            sCgaO[owner_thread * blk_tile_n + head]
+                        reduced_o0 = Float32(sCgaO[row * blk_tile_n + head])
+                        reduced_o1 = Float32(
+                            sCgaO[(warpgroup_threads + row) * blk_tile_n + head]
                         )
 
                         for source in cutlass.range(1, kv_splits):
                             local_max = sCgaStats[source, head, 0]
+                            local_sum = sCgaStats[source, head, 1]
                             next_max = cute.arch.fmax(reduced_max, local_max)
                             corr_old = Float32(0)
                             corr_new = Float32(0)
                             if reduced_sum > 0:
                                 corr_old = exp2(reduced_max - next_max)
-                            if sCgaStats[source, head, 1] > 0:
+                            if local_sum > 0:
                                 corr_new = exp2(local_max - next_max)
-                            local_o = Float32(
-                                sCgaO[
-                                    (source * owner_threads + owner_thread)
-                                    * blk_tile_n
-                                    + head
-                                ]
-                            )
-                            reduced_sum = (
-                                reduced_sum * corr_old
-                                + sCgaStats[source, head, 1] * corr_new
-                            )
-                            reduced_o = reduced_o * corr_old + local_o * corr_new
+                            offset = (source * owner_threads + row) * blk_tile_n + head
+                            local_o0 = Float32(sCgaO[offset])
+                            local_o1 = Float32(sCgaO[warpgroup_threads * blk_tile_n + offset])
+                            reduced_o0 = reduced_o0 * corr_old + local_o0 * corr_new
+                            reduced_o1 = reduced_o1 * corr_old + local_o1 * corr_new
+                            reduced_sum = reduced_sum * corr_old + local_sum * corr_new
                             reduced_max = next_max
 
-                        value = Float32(0)
+                        value0 = Float32(0)
+                        value1 = Float32(0)
                         if reduced_sum > 0:
-                            value = reduced_o * cute.arch.rcp_approx(reduced_sum) * scale_o
-                        final_o[head] = o_dtype(value)
-
-                    for head in cutlass.range_constexpr(blk_tile_n):
+                            inv_sum = cute.arch.rcp_approx(reduced_sum)
+                            value0 = reduced_o0 * inv_sum * scale_o
+                            value1 = reduced_o1 * inv_sum * scale_o
+                        output_d = row * kv_splits + kv_split_idx
                         group_head = coord_hg * blk_tile_h + head
                         if group_head < mOFinal.shape[1][0]:
-                            mOFinal[
-                                warpgroup_tidx,
-                                (group_head, 0),
-                                (coord_hk, coord_b),
-                            ] = final_o[head]
+                            mOFinal[output_d, (group_head, 0), (coord_hk, coord_b)] = o_dtype(value0)
+                            mOFinal[mma_tile_m_vp + output_d, (group_head, 0), (coord_hk, coord_b)] = o_dtype(value1)
+                elif owner_cta == kv_split_idx:
+                    for dm in cutlass.range_constexpr(tiles_dm):
+                        final_o = cute.make_rmem_tensor((blk_tile_n,), o_dtype)
+                        for head in cutlass.range_constexpr(blk_tile_n):
+                            reduced_max = sCgaStats[0, head, 0]
+                            reduced_sum = sCgaStats[0, head, 1]
+                            reduced_o = Float32(
+                                sCgaO[(dm * warpgroup_threads + owner_thread)
+                                      * blk_tile_n + head]
+                            )
+                            for source in cutlass.range(1, kv_splits):
+                                local_max = sCgaStats[source, head, 0]
+                                next_max = cute.arch.fmax(reduced_max, local_max)
+                                corr_old = Float32(0)
+                                corr_new = Float32(0)
+                                if reduced_sum > 0:
+                                    corr_old = exp2(reduced_max - next_max)
+                                if sCgaStats[source, head, 1] > 0:
+                                    corr_new = exp2(local_max - next_max)
+                                local_o = Float32(
+                                    sCgaO[
+                                        (dm * warpgroup_threads
+                                         + source * owner_threads + owner_thread)
+                                        * blk_tile_n
+                                        + head
+                                    ]
+                                )
+                                reduced_sum = (
+                                    reduced_sum * corr_old
+                                    + sCgaStats[source, head, 1] * corr_new
+                                )
+                                reduced_o = reduced_o * corr_old + local_o * corr_new
+                                reduced_max = next_max
+                            value = Float32(0)
+                            if reduced_sum > 0:
+                                value = reduced_o * cute.arch.rcp_approx(reduced_sum) * scale_o
+                            final_o[head] = o_dtype(value)
+                        for head in cutlass.range_constexpr(blk_tile_n):
+                            group_head = coord_hg * blk_tile_h + head
+                            if group_head < mOFinal.shape[1][0]:
+                                mOFinal[
+                                    dm * mma_tile_m_vp + warpgroup_tidx,
+                                    (group_head, 0),
+                                    (coord_hk, coord_b),
+                                ] = final_o[head]
 
         if warp_idx == reduction_warp_id:
             if cutlass.const_expr(do_partial_red):

@@ -26,23 +26,25 @@ class NVFP4Settings:
     sm120_tuner: bool
 
 
+def env_flag(env, name, default='0'):
+    value = env.get(name, default)
+    if value not in ('0', '1'):
+        raise ValueError(f'{name} must be 0 or 1, got {value!r}')
+    return value == '1'
+
+
+def env_threshold(env, name, default=None):
+    raw = env.get(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f'{name} must be nonnegative')
+    return value
+
+
 def parse_settings(env) -> NVFP4Settings:
     """Validate NVFP4 environment variables without reading global state."""
-    def flag(name, default='0'):
-        value = env.get(name, default)
-        if value not in ('0', '1'):
-            raise ValueError(f'{name} must be 0 or 1, got {value!r}')
-        return value == '1'
-
-    def threshold(name):
-        raw = env.get(name)
-        if raw is None:
-            return None
-        value = int(raw)
-        if value < 0:
-            raise ValueError(f'{name} must be nonnegative')
-        return value
-
     mode = env.get('RESIDUE_PATCH_MODE', 'v2').strip().lower().replace('-', '_') or 'v2'
     if mode not in ('v2', 'mext_r1'):
         raise ValueError(f'Unknown RESIDUE_PATCH_MODE={mode!r}; expected v2 or mext_r1')
@@ -57,15 +59,15 @@ def parse_settings(env) -> NVFP4Settings:
     return NVFP4Settings(
         mode=mode,
         projections=tuple(part.strip() for part in projection_names.split(',') if part.strip()),
-        decode_mext=flag('RESIDUE_ENABLE_DECODE_MEXT'),
+        decode_mext=env_flag(env, 'RESIDUE_ENABLE_DECODE_MEXT'),
         swap=False,  # Only the standard layout is exposed.
-        force_fold=flag('RESIDUE_FORCE_DECODE_MEXT'),
-        disable_sm10x=flag('RESIDUE_DISABLE_SM10X_FOLD'),
-        decode_max_m=threshold('RESIDUE_DECODE_MEXT_MAX_M'),
-        ratio1_max_m=threshold('RESIDUE_MEXT_FOLD_MAX_M'),
+        force_fold=env_flag(env, 'RESIDUE_FORCE_DECODE_MEXT'),
+        disable_sm10x=env_flag(env, 'RESIDUE_DISABLE_SM10X_FOLD'),
+        decode_max_m=env_threshold(env, 'RESIDUE_DECODE_MEXT_MAX_M'),
+        ratio1_max_m=env_threshold(env, 'RESIDUE_MEXT_FOLD_MAX_M'),
         ratio1_prefill=ratio1_prefill,
-        sm10x_tuner=flag('RESIDUE_SM10X_FOLD_TUNER', '1'),
-        sm120_tuner=flag('RESIDUE_SM120_FOLD_TUNER', '1'),
+        sm10x_tuner=env_flag(env, 'RESIDUE_SM10X_FOLD_TUNER', '1'),
+        sm120_tuner=env_flag(env, 'RESIDUE_SM120_FOLD_TUNER', '1'),
     )
 
 

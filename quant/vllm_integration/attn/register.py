@@ -45,7 +45,15 @@ def install(force: bool = False) -> bool:
         diagnostics.log_registration_failure("vLLM attention registry unavailable", e)
         return False
 
-    if getattr(reg, _INSTALLED_ATTR, False):
+    backend = os.environ.get("RESIDUE_ATTN_BACKEND", "resattn")
+    if backend not in ("resattn", "trtllm"):
+        raise ValueError("RESIDUE_ATTN_BACKEND must be resattn or trtllm")
+    class_path = (_BACKEND_CLASS_PATH if backend == "resattn" else
+                  "quant.vllm_integration.attn.backend.TrtBf16FlashInferBackend")
+    installed = getattr(reg, _INSTALLED_ATTR, False)
+    if installed:
+        if installed != class_path:
+            raise RuntimeError("Attention backend already installed; use a fresh worker")
         return True
 
     if not _registry_shape_ok(reg):
@@ -71,8 +79,8 @@ def install(force: bool = False) -> bool:
         return False
 
     reg.register_backend(
-        reg.AttentionBackendEnum.CUSTOM, class_path=_BACKEND_CLASS_PATH
+        reg.AttentionBackendEnum.CUSTOM, class_path=class_path
     )
-    setattr(reg, _INSTALLED_ATTR, True)
-    diagnostics.log_registration_success(_BACKEND_CLASS_PATH)
+    setattr(reg, _INSTALLED_ATTR, class_path)
+    diagnostics.log_registration_success(class_path)
     return True

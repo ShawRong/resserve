@@ -10,7 +10,6 @@ from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     nvfp4_split_data_scale,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferBackend,
@@ -34,7 +33,7 @@ def _require_trtllm_decode(metadata):
             or decode.kernel is not FlashInferDecodeKernel.TRTLLM_GEN):
         raise NotImplementedError(
             "ResAttn requires stock FlashInfer TRTLLM_GEN decode metadata "
-            "for NVFP4 KV and page128"
+            "for NVFP4 KV"
         )
     return decode
 
@@ -78,6 +77,7 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
         md = self.build(0, common_attn_metadata)
+        md._resinfer_graph_capture = True
         if md.num_decodes:
             decode = _require_trtllm_decode(md)
             decode.max_seq_len = max(
@@ -89,6 +89,7 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
 class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
     can_return_lse_for_decode = False
 
+    decode_backend = "resattn"
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         gqa = (
@@ -116,12 +117,11 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         self._decode_reduction_workspaces = {}
         self._residue_pool_key = None
         self._residue_pool = None
-        _register_decode_warmup(
-            self.num_heads, self.num_kv_heads, self.head_size)
+        if self.decode_backend == "resattn":
+            _register_decode_warmup(self.num_heads, self.num_kv_heads, self.head_size)
 
     def fused_output_quant_supported(self, quant_key):
-        return bool(self.is_kvcache_nvfp4 and self.head_size == 128
-                    and quant_key == kNvfp4Dynamic)
+        return False
 
     def _pool_for(self, kv_cache, layer):
         key = (kv_cache.data_ptr(), tuple(kv_cache.shape), kv_cache.stride(),
@@ -133,12 +133,13 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             v = canonicalize_singleton_dim_strides(v.permute(*order))
             kd, ks = nvfp4_split_data_scale(k)
             vd, vs = nvfp4_split_data_scale(v)
-            if tuple(kd.shape[1:]) != (self.num_kv_heads, 128, self.head_size // 2):
-                raise ValueError("ResAttn requires stock HND, page128, matching head-dimension cache")
+            page_size = kd.shape[2]
+            if page_size != 32 or tuple(kd.shape[1:]) != (self.num_kv_heads, page_size, self.head_size // 2):
+                raise ValueError("ResAttn requires stock HND page32 with matching head dimension")
             self._residue_pool = NvFp4PagedKVPool(
                 num_kv_heads=self.num_kv_heads, head_dim=self.head_size,
                 k_data=kd, v_data=vd, k_sf=ks, v_sf=vs,
-                page_size=128,
+                page_size=page_size,
                 k_global_scale=key[-2], v_global_scale=key[-1],
             )
             self._residue_pool_key = key
@@ -146,25 +147,20 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
-        if output_scale is None and output_block_scale is None:
-            scales = None
-        elif output_scale is not None and output_block_scale is not None:
-            scales = (output_scale, output_block_scale)
-        else:
-            raise ValueError("NVFP4 attention output requires data and block scales")
-        fused_nvfp4 = scales is not None
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("page32 attention returns BF16 output only")
         if attn_metadata is None:
             return output.fill_(0)
         if query.dtype != torch.bfloat16:
             raise ValueError("ResAttn needs original BF16 Q, not FP8 Q")
-        if output.dtype != (torch.uint8 if fused_nvfp4 else torch.bfloat16):
+        if output.dtype != torch.bfloat16:
             raise ValueError("ResAttn output dtype does not match fusion mode")
         md = attn_metadata
         if md.num_prefill_tokens:
             # vLLM already wrote KV once before this forward.
             prefill_md = md
             q_pre, k_pre, v_pre = query, key, value
-            bf16_output = output if scales is None else torch.empty_like(query)
+            bf16_output = output
             prefill_output = bf16_output
             if md.num_decodes:
                 n, end = md.num_decode_tokens, md.num_actual_tokens
@@ -174,41 +170,45 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
                     slot_mapping=md.slot_mapping[n:end])
                 q_pre, k_pre, v_pre = query[n:end], key[n:end], value[n:end]
                 prefill_output = bf16_output[n:end]
-            # Stock NVFP4 prefill uses FP8 Q/output and converts back to BF16.
-            # These upstream conversions remain part of mixed E2E cost.
-            super().forward(layer, q_pre, k_pre, v_pre, kv_cache,
-                            prefill_md, prefill_output)
+            pool = self._pool_for(kv_cache, layer)
+            self._prefill_bf16(layer, q_pre, pool, prefill_md, prefill_output)
             if md.num_decodes:
                 _require_trtllm_decode(md)
                 self._decode_forward(query, self._pool_for(kv_cache, layer),
                                      md, bf16_output)
-            if scales is not None:
-                # shortcut: pack combined BF16 output to avoid overlapping scale
-                # tiles; revisit when prefill supports compatible direct output.
-                output_scale, output_block_scale = scales
-                n = md.num_actual_tokens
-                torch.ops._C.scaled_fp4_quant.out(
-                    input=bf16_output[:n].reshape(n, self.num_heads * self.head_size),
-                    input_scale=output_scale,
-                    is_sf_swizzled_layout=True,
-                    output=output[:n].reshape(n, self.num_heads * self.head_size // 2),
-                    output_scale=output_block_scale.view(torch.int32),
-                )
             return output
         if md.num_decodes:
             _require_trtllm_decode(md)
             pool = self._pool_for(kv_cache, layer)
-            if scales is not None:
-                output_scale, output_block_scale = scales
-                self._decode_forward_nvfp4(
-                    query, pool, md, output,
-                    output_scale, output_block_scale,
-                )
-            else:
-                self._decode_forward(query, pool, md, output)
+            self._decode_forward(query, pool, md, output)
         return output
 
 
+    def _prefill_bf16(self, layer, query, pool, md, output):
+        from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+        from vllm import _custom_ops
+        from vllm.v1.attention.backends.flashinfer import _get_trtllm_workspace_buffer
+        from quant.flashinfer_integration.trt_attn import backend_info
+        backend_info()
+        n = md.num_prefill_tokens
+        q = query.reshape(-1, self.num_heads * self.head_size)[:n]
+        q8, _ = _custom_ops.scaled_fp8_quant(q, scale=layer._q_scale)
+        q8 = canonicalize_singleton_dim_strides(
+            q8.reshape(n, self.num_heads, self.head_size))
+        prefill = md.prefill
+        trtllm_batch_context_with_kv_cache(
+            query=q8, kv_cache=(pool.k_data, pool.v_data),
+            workspace_buffer=_get_trtllm_workspace_buffer(),
+            block_tables=prefill.block_tables.contiguous(),
+            seq_lens=prefill.seq_lens, max_q_len=prefill.max_q_len,
+            max_kv_len=prefill.max_seq_len, batch_size=md.num_prefills,
+            cum_seq_lens_q=prefill.cum_seq_lens_q,
+            cum_seq_lens_kv=prefill.cum_seq_lens_kv,
+            bmm1_scale=self.scale * layer._q_scale_float * pool.k_global_scale,
+            bmm2_scale=pool.v_global_scale,
+            out=output.reshape(-1, self.num_heads, self.head_size)[:n],
+            kv_cache_sf=(pool.k_sf, pool.v_sf), enable_pdl=False)
+        self._native_bf16_prefill_calls = getattr(self, '_native_bf16_prefill_calls', 0) + 1
 class ResAttnFlashInferBackend(FlashInferBackend):
     """Stock prefill/cache contract with ResAttn decode, including mixed batches."""
     supported_dtypes = [torch.bfloat16]
@@ -229,7 +229,7 @@ class ResAttnFlashInferBackend(FlashInferBackend):
     @staticmethod
     def get_supported_kernel_block_sizes():
         # vLLM splits larger hybrid-cache allocation blocks into kernel pages.
-        return [128]
+        return [32]
 
     @classmethod
     def get_supported_head_sizes(cls):
@@ -238,3 +238,35 @@ class ResAttnFlashInferBackend(FlashInferBackend):
     @classmethod
     def supports_sink(cls):
         return False
+class TrtBf16FlashInferImpl(ResAttnFlashInferImpl):
+    decode_backend = "trtllm"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._trt_decode_buffers = {}
+    def _decode_forward(self, query, pool, md, output):
+        from quant.flashinfer_integration.trt_attn import TrtDecode
+        from vllm.v1.attention.backends.flashinfer import _get_trtllm_workspace_buffer
+        if pool.page_size != 32:
+            raise ValueError("Native-BF16 TRT decode requires --block-size 32")
+        n = md.num_decode_tokens
+        q = query.reshape(-1, self.num_heads, self.head_size)[:n]
+        out = output.reshape(-1, self.num_heads, self.head_size)[:n]
+        graph = getattr(md, "_resinfer_graph_capture", False)
+        key = n if graph else 0
+        buffer = self._trt_decode_buffers.get(key)
+        if buffer is None or buffer.q8.shape[0] != n:
+            buffer = self._trt_decode_buffers[key] = TrtDecode(q, _get_trtllm_workspace_buffer())
+        decode = md.decode
+        bound = decode.block_tables.shape[1] * pool.page_size
+        length = bound if graph else max(1, decode.max_seq_len)
+        buffer.run(
+            q, (pool.k_data, pool.k_sf, pool.v_data, pool.v_sf),
+            decode.block_tables, decode.seq_lens, out, length,
+            sm_scale=self.scale, k_scale=pool.k_global_scale, v_scale=pool.v_global_scale)
+class TrtBf16FlashInferBackend(ResAttnFlashInferBackend):
+    @staticmethod
+    def get_impl_cls():
+        return TrtBf16FlashInferImpl
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [32]

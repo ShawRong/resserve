@@ -53,8 +53,14 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
             raise ValueError("ModelOpt MXFP4 adapter requires quant_algo=MXFP4")
         if quant.get("group_size", 32) != 32:
             raise ValueError("MXFP4 requires group_size=32")
-        if quant.get("kv_cache_quant_algo") or quant.get("kv_cache_scheme"):
-            raise ValueError("MXFP4 adapter does not support quantized KV cache")
+        kv_algo = quant.get("kv_cache_quant_algo")
+        kv_scheme = quant.get("kv_cache_scheme")
+        if kv_algo and str(kv_algo).upper() != "NVFP4":
+            raise ValueError("MXFP4 adapter only supports NVFP4 checkpoint KV scales")
+        if kv_scheme and kv_scheme != {
+            "num_bits": 4, "type": "float", "strategy": "tensor", "dynamic": False,
+        }:
+            raise ValueError("MXFP4 adapter requires static per-tensor NVFP4 KV scales")
         excluded = quant.get("exclude_modules", quant.get("ignore", []))
         if not isinstance(excluded, list) or any(not isinstance(v, str) for v in excluded):
             raise ValueError("ModelOpt exclude_modules/ignore must be a list of strings")
@@ -68,7 +74,7 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
         if isinstance(layer, RoutedExperts):
             raise ValueError("ResInfer MXFP4 supports dense Linear layers only")
         if not isinstance(layer, LinearBase):
-            return None
+            return super().get_quant_method(layer, prefix)
         candidates = get_residue_layer_candidates(prefix)
         groups = get_fused_hf_candidates(prefix)
         excluded = [self.is_layer_excluded(name) for name in candidates]
@@ -106,9 +112,13 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
     """Load packed uint8 weights/scales and dispatch the opaque MXFP4 op."""
 
     def __init__(self, metadata=None, *, extended_dim=None):
+        from .env_contract import env_flag, env_threshold
         self.metadata = metadata or {}
         self.extended_dim = extended_dim
 
+        enabled = env_flag(os.environ, "RESIDUE_ENABLE_DECODE_MEXT")
+        limit = env_threshold(os.environ, "RESIDUE_DECODE_MEXT_MAX_M", 128)
+        self.mext_max_m = limit if enabled else 0
     def create_weights(
         self,
         layer,
@@ -247,10 +257,16 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             if (layer.weight_scale == 255).any().item():
                 raise ValueError("MXFP4 checkpoint contains NaN E8M0 scale code 255")
 
+            base_scales = None
+            if self.mode == "selective" and self.mext_max_m > 0:
+                base_scales = swizzle_scales(
+                    layer.weight_scale.detach()[:, :layer._mxfp4_input_size // 32].contiguous()
+                )
             scales = swizzle_scales(layer.weight_scale.detach())
             del layer.weight_scale
             layer.weight = Parameter(weight, requires_grad=False)
             layer.register_buffer("weight_scale", scales)
+            layer.register_buffer("weight_scale_base", base_scales)
             layer.register_buffer("salient_indices", indices)
             layer.register_buffer("salient_masks", masks)
             layer._mxfp4_prepared = True
@@ -273,4 +289,6 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             self.mode,
             layer._mxfp4_output_dtype,
             bias,
+            self.mext_max_m,
+            layer.weight_scale_base,
         )

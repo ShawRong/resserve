@@ -9,7 +9,7 @@ from typing import ClassVar
 import torch
 
 SF_VEC = 16
-PAGE_SIZE = 128
+PAGE_SIZE = 32
 
 
 @dataclass

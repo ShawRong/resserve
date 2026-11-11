@@ -28,7 +28,7 @@ def select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
         raise NotImplementedError("production ResAttn requires residue Q8/Q16")
     splits, reducer = _select_decode_plan(
         batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4)
-    if (policy == "deterministic" or head_dim == 256) and reducer not in ("none", "kernel"):
+    if policy == "deterministic" and reducer not in ("none", "kernel"):
         reducer = "kernel"
     return splits, reducer
 
@@ -40,8 +40,6 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
         raise NotImplementedError("production ResAttn requires residue Q8/Q16")
     _check_output_dimension(head_dim, output_nvfp4)
     plans = [(1, "none"), (2, "kernel")]
-    if head_dim == 256:
-        return tuple(plans)
     if output_nvfp4:
         plans.extend(((4, "gmem_fused"), (16, "gmem_fused")))
     else:
@@ -53,8 +51,8 @@ def validate_decode_plan(plan, *, output_nvfp4=False, head_dim=128):
     """Check launch constraints before compilation or workspace allocation."""
     _check_output_dimension(head_dim, output_nvfp4)
     splits, reducer = plan
-    if head_dim == 256 and reducer not in ("none", "kernel"):
-        raise NotImplementedError("D256 supports none/kernel reduction only")
+    if head_dim == 256 and reducer not in ("none", "kernel", "cga_sharded"):
+        raise NotImplementedError("D256 supports none/kernel/CGA reduction only")
     if type(splits) is not int or splits < 1:
         raise ValueError(f"decode plan splits must be a positive integer, got {splits!r}")
     if reducer not in ("none", "kernel", "cga_sharded", "gmem_fused"):

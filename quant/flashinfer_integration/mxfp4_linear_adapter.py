@@ -11,7 +11,7 @@ import torch
 from .fi_tuner_base import tile8_pad_multiple
 from .linear_tuner import LINEAR_BUCKETS, LinearSpec, tuned_linear
 
-_VERSION = 5  # Shared M buckets replace exact-size profiles.
+_VERSION = 6
 _FAMILIES = (("row_pair", "std"), ("tile8", "std"), ("tile8", "pi"))
 _DEFAULT = (("row_pair", "std"), "tma", (128, 128), (1, 1), None)
 
@@ -101,6 +101,7 @@ def _valid(inputs, policy, _tuning):
             tile, cluster, out_dtype, mode=STORE_MODE_TO_MODE[mode],
             kernel_arch="sm100", ab_stage_override=ab,
             pi_via_layout=family == ("tile8", "pi"), fp4_format="mxfp4",
+            strided_weight=inputs[1].stride(0) != inputs[1].shape[1],
             compile_if_missing=False,
         ) is not None:
             valid.append(index)

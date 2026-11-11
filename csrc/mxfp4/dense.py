@@ -8,13 +8,20 @@ import torch
 from ..cute_fold.host import _compile_fold_gemm, mext_fold_gemm
 
 
-def _validate(a, b, sa, sb, out_dtype):
+def _validate(a, b, sa, sb, out_dtype, *, allow_strided_weight=False):
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
         raise ValueError("expected A[M,K/2], B[N,K/2]")
     if not a.is_cuda or any(t.device != a.device for t in (b, sa, sb)):
         raise ValueError("all tensors must share a CUDA device")
-    if any(t.dtype != torch.uint8 or not t.is_contiguous() for t in (a, b, sa, sb)):
-        raise ValueError("packed data and 128x4 scales must be contiguous uint8")
+    if any(t.dtype != torch.uint8 for t in (a, b, sa, sb)):
+        raise ValueError("packed data and 128x4 scales must be uint8")
+    if any(not t.is_contiguous() for t in (a, sa, sb)):
+        raise ValueError("activation and 128x4 scales must be contiguous")
+    if allow_strided_weight:
+        if b.stride(1) != 1 or b.stride(0) < b.shape[1] or b.stride(0) % 32:
+            raise ValueError("Fold weight requires nonoverlapping K-contiguous rows with 32B-aligned stride")
+    elif not b.is_contiguous():
+        raise ValueError("dense weight must be contiguous")
     m, kp = a.shape
     n = b.shape[0]
     k = kp * 2
@@ -50,7 +57,8 @@ def fold_gemm(a_rowpair, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
               mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1),
               store_mode="tma", pi_via_layout=False, ab_stage_override=None):
     """Compute MXFP4 GEMM with full-channel residue compensation."""
-    m2, _, _, arch = _validate(a_rowpair, b, a_scale, b_scale, out_dtype)
+    m2, _, _, arch = _validate(a_rowpair, b, a_scale, b_scale, out_dtype,
+                               allow_strided_weight=True)
     if m2 % 2:
         raise ValueError("MExt input needs an even number of physical rows")
     if store_mode not in ("tma", "tma_mext", "direct_mext"):

@@ -110,10 +110,10 @@ reference isolates attention computation error; lower NMSE is better.
 ## 🚀 Installation
 
 Use Linux x86-64 and Python 3.12 with a compatible CUDA framework stack.
-The integration measurements used PyTorch 2.11, vLLM 0.26, FlashInfer 0.7
-and CUTLASS DSL 4.8. These versions require coordinated dependency setup;
-this source distribution does not provision an environment. Export additionally
-requires NVIDIA ModelOpt, Transformers and the checkpoint's tokenizer dependencies.
+The runtime uses PyTorch, vLLM, FlashInfer and CUTLASS DSL.
+Page32 attention requires a patched FlashInfer build with the matching
+BF16-output kernel artifacts. Export additionally requires NVIDIA ModelOpt,
+Transformers and the checkpoint's tokenizer dependencies.
 
 NVFP4 Fold has SM100 and SM120 implementations. MXFP4 MEXT targets SM100.
 ResAttn targets SM100 with head dimensions 128 or 256. Native quantization
@@ -173,11 +173,16 @@ and larger-M ratio1 prefill retain their automatic selection rules.
 For MXFP4, unset `RESIDUE_NVFP4`, set `RESIDUE_MXFP4=1` and use a ModelOpt MXFP4
 checkpoint. Its metadata determines the residue mode. Do not enable both
 linear format gates for one model.
+Set `RESIDUE_ENABLE_DECODE_MEXT=1` and `RESIDUE_DECODE_MEXT_MAX_M=128`
+to enable small-M MEXT for plain or selective checkpoints. This is an M
+threshold that also includes small prefill batches. Above it, MXFP4 uses
+FlashInfer CuTeDSL GEMM with its original plain/selective quantization.
 
 To enable ResAttn on a supported model, add `RESIDUE_ATTN=1` and vLLM options
-`--attention-backend CUSTOM --kv-cache-dtype nvfp4 --block-size 128`.
-Prefill uses the upstream path; ResAttn handles decode. Mixed batches are
-supported by the adapter, while full CUDA Graph support remains limited to
+`--attention-backend CUSTOM --kv-cache-dtype nvfp4 --block-size 32`.
+Prefill uses TRT with direct BF16 output; ResAttn handles decode.
+Set `RESIDUE_ATTN_BACKEND=trtllm` for the matched TRT BF16-output decode path.
+The adapter supports mixed batches; full CUDA Graph support remains limited to
 uniform single-token decode. The kernel plots above use BF16 attention output
 without output-quantization fusion.
 
@@ -197,19 +202,24 @@ or environment.
 
 ## 🛠️ Roadmap
 
-- [ ] **Paper** — coming soon.
+- [x] **MXFP4 kernels** — CuTeDSL GEMM and small-M MEXT for plain and selective checkpoints.
+- [x] **Page32 attention** — updated ResAttn and a matched TRT path with direct BF16 output; retired legacy page128 ResAttn.
+- [x] **Paper** — [Read on arXiv](https://arxiv.org/abs/2611.08713).
 - [ ] **ResMoE** — currently under development and will be released soon.
 
 ## 📝 Citation
 
-Our paper will be released soon. In the meantime, you can cite the software
-using this temporary entry; we will replace it with the paper citation.
+Read our [paper on arXiv](https://arxiv.org/abs/2611.08713).
+To cite our work, use the following entry:
 
 ```bibtex
-@misc{ResServe2026,
-  title = {ResServe},
+@misc{rong2026resserve,
+  title = {{ResServe}: Accurate and Efficient {FP4} {LLM} Inference with Residue Compensation},
+  author = {Shuo Rong and Ruibo Fan and Jiawen Wen and Xiaowen Chu},
   year = {2026},
-  note = {Software release, October 20, 2026. Paper forthcoming.}
+  eprint = {2611.08713},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2611.08713}
 }
 ```
 
