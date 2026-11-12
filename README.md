@@ -1,5 +1,7 @@
 # ResServe
 
+[![arXiv](https://img.shields.io/badge/arXiv-2611.08713-b31b1b.svg)](https://arxiv.org/abs/2611.08713)
+
 **Published: October 20, 2026**
 
 ResServe is a framework for **accurate** and **efficient FP4 inference** on
@@ -9,6 +11,10 @@ NVIDIA Blackwell GPUs. It combines **residue error compensation** with
 With **NVFP4 and MXFP4** linear kernels, **NVFP4 decode attention**, ModelOpt
 export, FlashInfer autotuning and **vLLM integration**, ResServe connects
 quantization research to practical model serving.
+
+<p align="center">
+  <img src="assets/overview.png" alt="ResServe overview: MExt folded GEMM, KExt selective prefill, and ResAttn residue attention" width="760">
+</p>
 
 ## ✨ Highlights
 
